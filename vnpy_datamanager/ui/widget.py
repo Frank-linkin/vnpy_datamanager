@@ -579,6 +579,37 @@ class DownloadDialog(QtWidgets.QDialog):
         )
         self.start_date_edit.setCalendarPopup(True)
 
+        self.use_end_date_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("指定结束日期")
+
+        self.end_date_edit: QtWidgets.QDateEdit = QtWidgets.QDateEdit(
+            QtCore.QDate(
+                end_dt.year,
+                end_dt.month,
+                end_dt.day
+            )
+        )
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setEnabled(False)
+        self.use_end_date_check.toggled.connect(self.end_date_edit.setEnabled)
+
+        end_shortcut_widget: QtWidgets.QWidget = QtWidgets.QWidget()
+        end_shortcut_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        end_shortcut_hbox.setContentsMargins(0, 0, 0, 0)
+
+        self.end_6m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("六个月")
+        self.end_6m_button.setEnabled(False)
+        self.end_6m_button.clicked.connect(lambda: self.set_end_date_from_start(6))
+        end_shortcut_hbox.addWidget(self.end_6m_button)
+
+        self.end_3m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("三个月")
+        self.end_3m_button.setEnabled(False)
+        self.end_3m_button.clicked.connect(lambda: self.set_end_date_from_start(3))
+        end_shortcut_hbox.addWidget(self.end_3m_button)
+
+        end_shortcut_widget.setLayout(end_shortcut_hbox)
+        self.use_end_date_check.toggled.connect(self.end_6m_button.setEnabled)
+        self.use_end_date_check.toggled.connect(self.end_3m_button.setEnabled)
+
         shortcut_widget: QtWidgets.QWidget = QtWidgets.QWidget()
         shortcut_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         shortcut_hbox.setContentsMargins(0, 0, 0, 0)
@@ -602,6 +633,9 @@ class DownloadDialog(QtWidgets.QDialog):
         form.addRow("周期", self.interval_combo)
         form.addRow("开始日期", self.start_date_edit)
         form.addRow("", shortcut_widget)
+        form.addRow("", self.use_end_date_check)
+        form.addRow("结束日期", self.end_date_edit)
+        form.addRow("", end_shortcut_widget)
         form.addRow(button)
 
         self.setLayout(form)
@@ -628,6 +662,26 @@ class DownloadDialog(QtWidgets.QDialog):
         new_year: int = total_months // 12
         new_month: int = total_months % 12 + 1
         return new_year, new_month
+
+    def set_end_date_from_start(self, months: int) -> None:
+        """"""
+        if not self.use_end_date_check.isChecked():
+            return
+
+        start_date: QtCore.QDate = self.start_date_edit.date()
+        year: int = start_date.year()
+        month: int = start_date.month()
+        day: int = start_date.day()
+
+        target_year, target_month = self.shift_month(year, month, months)
+        target_date: QtCore.QDate = QtCore.QDate(target_year, target_month, day)
+
+        if not target_date.isValid():
+            month_start: QtCore.QDate = QtCore.QDate(target_year, target_month, 1)
+            day_offset: int = day - 1
+            target_date = month_start.addDays(day_offset)
+
+        self.end_date_edit.setDate(target_date)
 
     @staticmethod
     def parse_contract_year_month(symbol: str, exchange: Exchange) -> tuple[int, int] | None:
@@ -685,10 +739,16 @@ class DownloadDialog(QtWidgets.QDialog):
         start: datetime = datetime(start_date.year(), start_date.month(), start_date.day())
         start = start.replace(tzinfo=DB_TZ)
 
+        end: datetime | None = None
+        if self.use_end_date_check.isChecked():
+            end_date = self.end_date_edit.date()
+            end = datetime(end_date.year(), end_date.month(), end_date.day()) + timedelta(days=1)
+            end = end.replace(tzinfo=DB_TZ)
+
         if interval == Interval.TICK:
-            count: int = self.engine.download_tick_data(symbol, exchange, start, self.output)
+            count: int = self.engine.download_tick_data(symbol, exchange, start, self.output, end=end)
         else:
-            count = self.engine.download_bar_data(symbol, exchange, interval, start, self.output)
+            count = self.engine.download_bar_data(symbol, exchange, interval, start, self.output, end=end)
 
         QtWidgets.QMessageBox.information(self, "下载结束", f"下载总数据量：{count}条")
 
