@@ -1,4 +1,5 @@
 from functools import partial
+import re
 from datetime import datetime, timedelta
 
 from vnpy.trader.ui import QtWidgets, QtCore
@@ -576,6 +577,21 @@ class DownloadDialog(QtWidgets.QDialog):
                 start_dt.day
             )
         )
+        self.start_date_edit.setCalendarPopup(True)
+
+        shortcut_widget: QtWidgets.QWidget = QtWidgets.QWidget()
+        shortcut_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        shortcut_hbox.setContentsMargins(0, 0, 0, 0)
+
+        last_6m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前6个月")
+        last_6m_button.clicked.connect(lambda: self.set_start_date_by_symbol(6))
+        shortcut_hbox.addWidget(last_6m_button)
+
+        last_3m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前3个月")
+        last_3m_button.clicked.connect(lambda: self.set_start_date_by_symbol(3))
+        shortcut_hbox.addWidget(last_3m_button)
+
+        shortcut_widget.setLayout(shortcut_hbox)
 
         button: QtWidgets.QPushButton = QtWidgets.QPushButton("下载")
         button.clicked.connect(self.download)
@@ -585,9 +601,79 @@ class DownloadDialog(QtWidgets.QDialog):
         form.addRow("交易所", self.exchange_combo)
         form.addRow("周期", self.interval_combo)
         form.addRow("开始日期", self.start_date_edit)
+        form.addRow("", shortcut_widget)
         form.addRow(button)
 
         self.setLayout(form)
+
+    def set_start_date_by_symbol(self, months: int) -> None:
+        """"""
+        symbol: str = self.symbol_edit.text().strip()
+        if not symbol:
+            return
+
+        exchange: Exchange = self.exchange_combo.currentData()
+        contract_ym: tuple[int, int] | None = self.parse_contract_year_month(symbol, exchange)
+        if contract_ym is None:
+            return
+
+        year, month = contract_ym
+        start_year, start_month = self.shift_month(year, month, -months)
+        self.start_date_edit.setDate(QtCore.QDate(start_year, start_month, 1))
+
+    @staticmethod
+    def shift_month(year: int, month: int, month_delta: int) -> tuple[int, int]:
+        """"""
+        total_months: int = year * 12 + (month - 1) + month_delta
+        new_year: int = total_months // 12
+        new_month: int = total_months % 12 + 1
+        return new_year, new_month
+
+    @staticmethod
+    def parse_contract_year_month(symbol: str, exchange: Exchange) -> tuple[int, int] | None:
+        """
+        Parse contract delivery year/month by exchange-specific symbol rules.
+        """
+        if exchange == Exchange.CZCE:
+            return DownloadDialog.parse_czce_year_month(symbol)
+
+        match: re.Match[str] | None = re.search(r"(\d{2})(\d{2})$", symbol)
+        if not match:
+            return None
+
+        year: int = 2000 + int(match.group(1))
+        month: int = int(match.group(2))
+        if month < 1 or month > 12:
+            return None
+
+        return year, month
+
+    @staticmethod
+    def parse_czce_year_month(symbol: str) -> tuple[int, int] | None:
+        """
+        CZCE futures symbols use 3 trailing digits: YMM, e.g. TA505 -> 2025-05.
+        Infer decade from the current year so current-generation contracts map correctly.
+        """
+        match: re.Match[str] | None = re.search(r"(\d)(\d{2})$", symbol)
+        if not match:
+            return None
+
+        year_digit: int = int(match.group(1))
+        month: int = int(match.group(2))
+        if month < 1 or month > 12:
+            return None
+
+        current_year: int = datetime.now().year
+        decade_start: int = current_year // 10 * 10
+        year: int = decade_start + year_digit
+
+        # Keep the inferred year close to the current contract cycle.
+        if year < current_year - 5:
+            year += 10
+        elif year > current_year + 4:
+            year -= 10
+
+        return year, month
 
     def download(self) -> None:
         """"""
