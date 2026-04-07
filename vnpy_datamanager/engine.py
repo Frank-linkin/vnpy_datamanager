@@ -3,6 +3,7 @@ from datetime import datetime
 from collections.abc import Callable
 
 from vnpy.trader.engine import BaseEngine, MainEngine, EventEngine
+from vnpy.trader.logger import logger
 from vnpy.trader.constant import Interval, Exchange
 from vnpy.trader.object import BarData, TickData, ContractData, HistoryRequest
 from vnpy.trader.database import BaseDatabase, get_database, BarOverview, DB_TZ
@@ -249,4 +250,11 @@ class ManagerEngine(BaseEngine):
             self.database.save_tick_data(data)
             return (len(data))
 
+        logger.bind(gateway_name="DataManager").warning(
+            "下载Tick数据返回0条，"
+            f"symbol={symbol}，exchange={exchange.value}，"
+            f"start={start}，end={end}，"
+            f"query_tick_history_response_type={type(data).__name__}，"
+            f"query_tick_history_response={data!r}"
+        )
         return 0
