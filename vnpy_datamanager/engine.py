@@ -189,7 +189,8 @@ class ManagerEngine(BaseEngine):
         interval: str,
         start: datetime,
         output: Callable,
-        end: datetime | None = None
+        end: datetime | None = None,
+        dividend_type: str = "none",
     ) -> int:
         """
         Query bar data from datafeed.
@@ -204,6 +205,7 @@ class ManagerEngine(BaseEngine):
             start=start,
             end=end
         )
+        req.dividend_type = dividend_type
 
         vt_symbol: str = f"{symbol}.{exchange.value}"
         contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
@@ -221,6 +223,13 @@ class ManagerEngine(BaseEngine):
             self.database.save_bar_data(data)
             return (len(data))
 
+        logger.bind(gateway_name="DataManager").warning(
+            "下载bar数据返回0条，"
+            f"symbol={symbol}，exchange={exchange.value}，"
+            f"start={start}，end={end}，"
+            f"query_tick_history_response_type={type(data).__name__}，"
+            f"query_tick_history_response={data!r}"
+        )
         return 0
 
     def download_tick_data(
@@ -229,7 +238,8 @@ class ManagerEngine(BaseEngine):
         exchange: Exchange,
         start: datetime,
         output: Callable,
-        end: datetime | None = None
+        end: datetime | None = None,
+        dividend_type: str = "none",
     ) -> int:
         """
         Query tick data from datafeed.
@@ -243,6 +253,7 @@ class ManagerEngine(BaseEngine):
             start=start,
             end=end
         )
+        req.dividend_type = dividend_type
 
         data: list[TickData] = self.datafeed.query_tick_history(req, output)
 

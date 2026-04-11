@@ -18,6 +18,14 @@ INTERVAL_NAME_MAP = {
     Interval.DAILY: "日线",
 }
 
+DIVIDEND_TYPE_CHOICES: list[tuple[str, str]] = [
+    ("不复权", "none"),
+    ("向前复权", "front"),
+    ("向后复权", "back"),
+    ("等比向前复权", "front_ratio"),
+    ("等比向后复权", "back_ratio"),
+]
+
 
 class ManagerWidget(QtWidgets.QWidget):
     """"""
@@ -567,6 +575,10 @@ class DownloadDialog(QtWidgets.QDialog):
         for i in Interval:
             self.interval_combo.addItem(str(i.name), i)
 
+        self.dividend_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for name, value in DIVIDEND_TYPE_CHOICES:
+            self.dividend_combo.addItem(name, value)
+
         end_dt: datetime = datetime.now()
         start_dt: datetime = end_dt - timedelta(days=3 * 365)
 
@@ -631,6 +643,7 @@ class DownloadDialog(QtWidgets.QDialog):
         form.addRow("代码", self.symbol_edit)
         form.addRow("交易所", self.exchange_combo)
         form.addRow("周期", self.interval_combo)
+        form.addRow("复权参数", self.dividend_combo)
         form.addRow("开始日期", self.start_date_edit)
         form.addRow("", shortcut_widget)
         form.addRow("", self.use_end_date_check)
@@ -734,6 +747,7 @@ class DownloadDialog(QtWidgets.QDialog):
         symbol: str = self.symbol_edit.text()
         exchange: Exchange = Exchange(self.exchange_combo.currentData())
         interval: Interval = Interval(self.interval_combo.currentData())
+        dividend_type: str = self.dividend_combo.currentData()
 
         start_date = self.start_date_edit.date()
         start: datetime = datetime(start_date.year(), start_date.month(), start_date.day())
@@ -746,9 +760,24 @@ class DownloadDialog(QtWidgets.QDialog):
             end = end.replace(tzinfo=DB_TZ)
 
         if interval == Interval.TICK:
-            count: int = self.engine.download_tick_data(symbol, exchange, start, self.output, end=end)
+            count: int = self.engine.download_tick_data(
+                symbol,
+                exchange,
+                start,
+                self.output,
+                end=end,
+                dividend_type=dividend_type,
+            )
         else:
-            count = self.engine.download_bar_data(symbol, exchange, interval, start, self.output, end=end)
+            count = self.engine.download_bar_data(
+                symbol,
+                exchange,
+                interval,
+                start,
+                self.output,
+                end=end,
+                dividend_type=dividend_type,
+            )
 
         QtWidgets.QMessageBox.information(self, "下载结束", f"下载总数据量：{count}条")
 
