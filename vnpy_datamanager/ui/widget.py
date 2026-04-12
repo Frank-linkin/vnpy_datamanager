@@ -9,7 +9,7 @@ from vnpy.trader.object import BarData
 from vnpy.trader.database import DB_TZ
 from vnpy.trader.utility import available_timezones
 
-from ..engine import APP_NAME, ManagerEngine, BarOverview
+from ..engine import APP_NAME, ManagerEngine, BarOverview, BatchDownloadTask
 
 
 INTERVAL_NAME_MAP = {
@@ -20,10 +20,10 @@ INTERVAL_NAME_MAP = {
 
 DIVIDEND_TYPE_CHOICES: list[tuple[str, str]] = [
     ("不复权", "none"),
-    ("向前复权", "front"),
-    ("向后复权", "back"),
-    ("等比向前复权", "front_ratio"),
-    ("等比向后复权", "back_ratio"),
+    ("前复权", "front"),
+    ("后复权", "back"),
+    ("等比前复权", "front_ratio"),
+    ("等比后复权", "back_ratio"),
 ]
 
 
@@ -56,6 +56,8 @@ class ManagerWidget(QtWidgets.QWidget):
 
         download_button: QtWidgets.QPushButton = QtWidgets.QPushButton("下载数据")
         download_button.clicked.connect(self.download_data)
+        batch_download_button: QtWidgets.QPushButton = QtWidgets.QPushButton("批量下载")
+        batch_download_button.clicked.connect(self.batch_download_data)
 
         hbox1: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         hbox1.addWidget(refresh_button)
@@ -63,6 +65,7 @@ class ManagerWidget(QtWidgets.QWidget):
         hbox1.addWidget(import_button)
         hbox1.addWidget(update_button)
         hbox1.addWidget(download_button)
+        hbox1.addWidget(batch_download_button)
 
         hbox2: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         hbox2.addWidget(self.tree)
@@ -397,6 +400,14 @@ class ManagerWidget(QtWidgets.QWidget):
         dialog: DownloadDialog = DownloadDialog(self.engine)
         dialog.exec_()
 
+    def batch_download_data(self) -> None:
+        """
+        Open batch download dialog.
+        打开批量下载对话框。
+        """
+        dialog: BatchDownloadDialog = BatchDownloadDialog(self.engine, self)
+        dialog.exec_()
+
     def show(self) -> None:
         """"""
         self.showMaximized()
@@ -553,6 +564,395 @@ class ImportDialog(QtWidgets.QDialog):
             self.file_edit.setText(filename)
 
 
+class BatchDownloadDialog(QtWidgets.QDialog):
+    """
+    Batch download dialog with in-memory task table.
+    批量下载对话框（任务仅存内存）。
+    """
+
+    headers: list[str] = [
+        "ID",
+        "代码",
+        "交易所",
+        "周期",
+        "复权",
+        "开始",
+        "结束",
+        "状态",
+        "错误",
+    ]
+
+    def __init__(self, engine: ManagerEngine, parent: QtWidgets.QWidget | None = None) -> None:
+        """
+        Initialize dialog and auto-refresh timer.
+        初始化对话框并启动自动刷新定时器。
+        """
+        super().__init__(parent)
+
+        self.engine: ManagerEngine = engine
+        self.setWindowTitle("批量下载")
+        self.resize(1100, 600)
+
+        self.timer: QtCore.QTimer = QtCore.QTimer(self)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self.refresh_table)
+
+        self.init_ui()
+        self.refresh_table()
+        self.timer.start()
+
+    def init_ui(self) -> None:
+        """
+        Build input form, shortcut buttons and task table.
+        构建参数输入区、快捷按钮和任务表格。
+        """
+        self.symbol_edit: QtWidgets.QLineEdit = QtWidgets.QLineEdit()
+
+        self.exchange_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for exchange in Exchange:
+            self.exchange_combo.addItem(exchange.name, exchange)
+
+        self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for interval in Interval:
+            self.interval_combo.addItem(interval.name, interval)
+
+        self.dividend_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for name, value in DIVIDEND_TYPE_CHOICES:
+            self.dividend_combo.addItem(name, value)
+
+        end_dt: datetime = datetime.now()
+        start_dt: datetime = end_dt - timedelta(days=365)
+
+        self.start_date_edit: QtWidgets.QDateEdit = QtWidgets.QDateEdit(
+            QtCore.QDate(start_dt.year, start_dt.month, start_dt.day)
+        )
+        self.start_date_edit.setCalendarPopup(True)
+
+        self.end_date_edit: QtWidgets.QDateEdit = QtWidgets.QDateEdit(
+            QtCore.QDate(end_dt.year, end_dt.month, end_dt.day)
+        )
+        self.end_date_edit.setCalendarPopup(True)
+
+        # Start date shortcuts: from small month range to large month range.
+        # 开始日期快捷按钮：按月份从小到大排列。
+        start_shortcut_widget: QtWidgets.QWidget = QtWidgets.QWidget()
+        start_shortcut_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        start_shortcut_hbox.setContentsMargins(0, 0, 0, 0)
+
+        start_3m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前3月")
+        start_3m_button.clicked.connect(lambda: self.set_start_date_by_symbol(3))
+        start_shortcut_hbox.addWidget(start_3m_button)
+
+        start_6m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前6月")
+        start_6m_button.clicked.connect(lambda: self.set_start_date_by_symbol(6))
+        start_shortcut_hbox.addWidget(start_6m_button)
+
+        start_9m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前9月")
+        start_9m_button.clicked.connect(lambda: self.set_start_date_by_symbol(9))
+        start_shortcut_hbox.addWidget(start_9m_button)
+
+        start_12m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前12月")
+        start_12m_button.clicked.connect(lambda: self.set_start_date_by_symbol(12))
+        start_shortcut_hbox.addWidget(start_12m_button)
+
+        start_shortcut_widget.setLayout(start_shortcut_hbox)
+
+        # End date shortcuts: add N months based on selected start date.
+        # 结束日期快捷按钮：基于开始日期向后推N个月。
+        end_shortcut_widget: QtWidgets.QWidget = QtWidgets.QWidget()
+        end_shortcut_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        end_shortcut_hbox.setContentsMargins(0, 0, 0, 0)
+
+        end_3m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("+3月")
+        end_3m_button.clicked.connect(lambda: self.set_end_date_from_start(3))
+        end_shortcut_hbox.addWidget(end_3m_button)
+
+        end_6m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("+6月")
+        end_6m_button.clicked.connect(lambda: self.set_end_date_from_start(6))
+        end_shortcut_hbox.addWidget(end_6m_button)
+
+        end_9m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("+9月")
+        end_9m_button.clicked.connect(lambda: self.set_end_date_from_start(9))
+        end_shortcut_hbox.addWidget(end_9m_button)
+
+        end_12m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("+12月")
+        end_12m_button.clicked.connect(lambda: self.set_end_date_from_start(12))
+        end_shortcut_hbox.addWidget(end_12m_button)
+
+        end_shortcut_widget.setLayout(end_shortcut_hbox)
+
+        add_button: QtWidgets.QPushButton = QtWidgets.QPushButton("添加任务")
+        add_button.clicked.connect(self.add_task)
+
+        form: QtWidgets.QFormLayout = QtWidgets.QFormLayout()
+        form.addRow("代码", self.symbol_edit)
+        form.addRow("交易所", self.exchange_combo)
+        form.addRow("周期", self.interval_combo)
+        form.addRow("复权参数", self.dividend_combo)
+        form.addRow("开始日期", self.start_date_edit)
+        form.addRow("", start_shortcut_widget)
+        form.addRow("结束日期", self.end_date_edit)
+        form.addRow("", end_shortcut_widget)
+        form.addRow(add_button)
+
+        form_widget: QtWidgets.QWidget = QtWidgets.QWidget()
+        form_widget.setLayout(form)
+
+        # Table mirrors engine in-memory task snapshots.
+        # 表格展示引擎中的内存任务快照。
+        self.table: QtWidgets.QTableWidget = QtWidgets.QTableWidget()
+        self.table.setColumnCount(len(self.headers))
+        self.table.setHorizontalHeaderLabels(self.headers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+
+        self.start_button: QtWidgets.QPushButton = QtWidgets.QPushButton("开始批量下载")
+        self.start_button.clicked.connect(self.start_batch_download)
+
+        remove_button: QtWidgets.QPushButton = QtWidgets.QPushButton("删除选中")
+        remove_button.clicked.connect(self.remove_selected_tasks)
+
+        clear_button: QtWidgets.QPushButton = QtWidgets.QPushButton("清空已完成")
+        clear_button.clicked.connect(self.clear_completed_tasks)
+
+        close_button: QtWidgets.QPushButton = QtWidgets.QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+
+        controls_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        controls_hbox.addWidget(self.start_button)
+        controls_hbox.addWidget(remove_button)
+        controls_hbox.addWidget(clear_button)
+        controls_hbox.addStretch()
+        controls_hbox.addWidget(close_button)
+
+        right_vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        right_vbox.addWidget(self.table)
+        right_vbox.addLayout(controls_hbox)
+
+        body_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        body_hbox.addWidget(form_widget, 1)
+        body_hbox.addLayout(right_vbox, 3)
+
+        self.setLayout(body_hbox)
+
+    def set_start_date_by_symbol(self, months: int) -> None:
+        """
+        Infer contract year/month from symbol and move start date backward.
+        根据合约代码推断年月，并回推开始日期。
+        """
+        symbol: str = self.symbol_edit.text().strip()
+        if not symbol:
+            return
+
+        exchange: Exchange = self.exchange_combo.currentData()
+        contract_ym: tuple[int, int] | None = self.parse_contract_year_month(symbol, exchange)
+        if contract_ym is None:
+            return
+
+        year, month = contract_ym
+        start_year, start_month = self.shift_month(year, month, -months)
+        self.start_date_edit.setDate(QtCore.QDate(start_year, start_month, 1))
+
+    @staticmethod
+    def shift_month(year: int, month: int, month_delta: int) -> tuple[int, int]:
+        """
+        Month arithmetic helper.
+        月份偏移计算工具函数。
+        """
+        total_months: int = year * 12 + (month - 1) + month_delta
+        new_year: int = total_months // 12
+        new_month: int = total_months % 12 + 1
+        return new_year, new_month
+
+    def set_end_date_from_start(self, months: int) -> None:
+        """
+        Set end date by adding N months from current start date.
+        以当前开始日期为基准增加N个月设置结束日期。
+        """
+        start_date: QtCore.QDate = self.start_date_edit.date()
+        year: int = start_date.year()
+        month: int = start_date.month()
+        day: int = start_date.day()
+
+        target_year, target_month = self.shift_month(year, month, months)
+        target_date: QtCore.QDate = QtCore.QDate(target_year, target_month, day)
+
+        # Fallback for month-end overflow (e.g. Jan 31 + 1 month).
+        # 处理月底溢出日期（如1月31日加1个月）。
+        if not target_date.isValid():
+            month_start: QtCore.QDate = QtCore.QDate(target_year, target_month, 1)
+            day_offset: int = day - 1
+            target_date = month_start.addDays(day_offset)
+
+        self.end_date_edit.setDate(target_date)
+
+    @staticmethod
+    def parse_contract_year_month(symbol: str, exchange: Exchange) -> tuple[int, int] | None:
+        """
+        Parse YYMM (or CZCE-specific format) from symbol.
+        从代码解析YYMM（或郑商所特例格式）。
+        """
+        if exchange == Exchange.CZCE:
+            return BatchDownloadDialog.parse_czce_year_month(symbol)
+
+        match: re.Match[str] | None = re.search(r"(\d{2})(\d{2})$", symbol)
+        if not match:
+            return None
+
+        year: int = 2000 + int(match.group(1))
+        month: int = int(match.group(2))
+        if month < 1 or month > 12:
+            return None
+        return year, month
+
+    @staticmethod
+    def parse_czce_year_month(symbol: str) -> tuple[int, int] | None:
+        """
+        Parse CZCE YMM format and infer decade near current year.
+        解析郑商所YMM格式，并推断接近当前年的十位年份。
+        """
+        match: re.Match[str] | None = re.search(r"(\d)(\d{2})$", symbol)
+        if not match:
+            return None
+
+        year_digit: int = int(match.group(1))
+        month: int = int(match.group(2))
+        if month < 1 or month > 12:
+            return None
+
+        current_year: int = datetime.now().year
+        decade_start: int = current_year // 10 * 10
+        year: int = decade_start + year_digit
+        if year < current_year - 5:
+            year += 10
+        elif year > current_year + 4:
+            year -= 10
+
+        return year, month
+
+    def add_task(self) -> None:
+        """
+        Validate form and append one in-memory batch task.
+        校验输入参数并新增一条内存任务。
+        """
+        symbol: str = self.symbol_edit.text().strip()
+        if not symbol:
+            QtWidgets.QMessageBox.warning(self, "参数错误", "代码不能为空")
+            return
+
+        exchange: Exchange = self.exchange_combo.currentData()
+        interval: Interval = self.interval_combo.currentData()
+        dividend_type: str = self.dividend_combo.currentData()
+
+        start_date = self.start_date_edit.date()
+        start: datetime = datetime(start_date.year(), start_date.month(), start_date.day()).replace(tzinfo=DB_TZ)
+
+        end_date = self.end_date_edit.date()
+        end: datetime = datetime(end_date.year(), end_date.month(), end_date.day()) + timedelta(days=1)
+        end = end.replace(tzinfo=DB_TZ)
+
+        if end <= start:
+            QtWidgets.QMessageBox.warning(self, "参数错误", "结束日期必须晚于开始日期")
+            return
+
+        # End date is stored as [start, end) convention, so +1 day above.
+        # 结束日期使用左闭右开区间，因此前面做了+1天处理。
+        self.engine.add_batch_download_task(
+            symbol=symbol,
+            exchange=exchange,
+            interval=interval,
+            dividend_type=dividend_type,
+            start=start,
+            end=end,
+        )
+        self.refresh_table()
+
+    def start_batch_download(self) -> None:
+        """
+        Trigger engine-side asynchronous batch workflow.
+        启动引擎侧异步批量下载流程。
+        """
+        success: bool
+        message: str
+        success, message = self.engine.start_batch_download()
+        if success:
+            QtWidgets.QMessageBox.information(self, "批量下载", message)
+        else:
+            QtWidgets.QMessageBox.warning(self, "批量下载", message)
+        self.refresh_table()
+
+    def remove_selected_tasks(self) -> None:
+        """
+        Remove selected rows if tasks are not running.
+        删除选中行对应任务（运行中任务会被跳过）。
+        """
+        task_ids: list[int] = []
+        for item in self.table.selectedItems():
+            row: int = item.row()
+            id_item: QtWidgets.QTableWidgetItem | None = self.table.item(row, 0)
+            if not id_item:
+                continue
+            task_ids.append(int(id_item.text()))
+
+        if not task_ids:
+            return
+
+        # Deduplicate because QTableWidget returns one item per selected cell.
+        # 表格按单元格返回选中项，因此先按任务ID去重。
+        unique_ids: list[int] = list(set(task_ids))
+        removed_count, skipped_count = self.engine.remove_batch_download_tasks(unique_ids)
+        QtWidgets.QMessageBox.information(
+            self,
+            "删除结果",
+            f"已删除 {removed_count} 条，跳过 {skipped_count} 条运行中任务",
+        )
+        self.refresh_table()
+
+    def clear_completed_tasks(self) -> None:
+        """
+        Clear completed tasks from in-memory list.
+        清空内存中的已完成任务。
+        """
+        removed_count: int = self.engine.clear_completed_batch_download_tasks()
+        QtWidgets.QMessageBox.information(self, "清理完成", f"已清理 {removed_count} 条任务")
+        self.refresh_table()
+
+    def refresh_table(self) -> None:
+        """
+        Pull task snapshots from engine and refresh table cells.
+        从引擎拉取任务快照并刷新表格。
+        """
+        tasks: list[BatchDownloadTask] = self.engine.get_batch_download_tasks()
+
+        self.table.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
+            self.table.setItem(row, 0, DataCell(str(task.task_id)))
+            self.table.setItem(row, 1, DataCell(task.symbol))
+            self.table.setItem(row, 2, DataCell(task.exchange.value))
+            self.table.setItem(row, 3, DataCell(task.interval.value))
+            self.table.setItem(row, 4, DataCell(task.dividend_type))
+            self.table.setItem(row, 5, DataCell(task.start.strftime("%Y-%m-%d")))
+            self.table.setItem(row, 6, DataCell((task.end - timedelta(days=1)).strftime("%Y-%m-%d")))
+            self.table.setItem(row, 7, DataCell(task.status))
+            self.table.setItem(row, 8, DataCell(task.error_message))
+
+        # Disable start button while current batch is running.
+        # 批量执行期间禁用“开始”按钮，避免重复启动。
+        running: bool = self.engine.is_batch_download_running()
+        self.start_button.setEnabled(not running)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """
+        Stop timer before dialog closes.
+        关闭对话框前停止定时刷新。
+        """
+        self.timer.stop()
+        super().closeEvent(event)
+
+
 class DownloadDialog(QtWidgets.QDialog):
     """"""
 
@@ -575,10 +975,6 @@ class DownloadDialog(QtWidgets.QDialog):
         for i in Interval:
             self.interval_combo.addItem(str(i.name), i)
 
-        self.dividend_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        for name, value in DIVIDEND_TYPE_CHOICES:
-            self.dividend_combo.addItem(name, value)
-
         end_dt: datetime = datetime.now()
         start_dt: datetime = end_dt - timedelta(days=3 * 365)
 
@@ -589,52 +985,6 @@ class DownloadDialog(QtWidgets.QDialog):
                 start_dt.day
             )
         )
-        self.start_date_edit.setCalendarPopup(True)
-
-        self.use_end_date_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("指定结束日期")
-
-        self.end_date_edit: QtWidgets.QDateEdit = QtWidgets.QDateEdit(
-            QtCore.QDate(
-                end_dt.year,
-                end_dt.month,
-                end_dt.day
-            )
-        )
-        self.end_date_edit.setCalendarPopup(True)
-        self.end_date_edit.setEnabled(False)
-        self.use_end_date_check.toggled.connect(self.end_date_edit.setEnabled)
-
-        end_shortcut_widget: QtWidgets.QWidget = QtWidgets.QWidget()
-        end_shortcut_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
-        end_shortcut_hbox.setContentsMargins(0, 0, 0, 0)
-
-        self.end_6m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("六个月")
-        self.end_6m_button.setEnabled(False)
-        self.end_6m_button.clicked.connect(lambda: self.set_end_date_from_start(6))
-        end_shortcut_hbox.addWidget(self.end_6m_button)
-
-        self.end_3m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("三个月")
-        self.end_3m_button.setEnabled(False)
-        self.end_3m_button.clicked.connect(lambda: self.set_end_date_from_start(3))
-        end_shortcut_hbox.addWidget(self.end_3m_button)
-
-        end_shortcut_widget.setLayout(end_shortcut_hbox)
-        self.use_end_date_check.toggled.connect(self.end_6m_button.setEnabled)
-        self.use_end_date_check.toggled.connect(self.end_3m_button.setEnabled)
-
-        shortcut_widget: QtWidgets.QWidget = QtWidgets.QWidget()
-        shortcut_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
-        shortcut_hbox.setContentsMargins(0, 0, 0, 0)
-
-        last_6m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前6个月")
-        last_6m_button.clicked.connect(lambda: self.set_start_date_by_symbol(6))
-        shortcut_hbox.addWidget(last_6m_button)
-
-        last_3m_button: QtWidgets.QPushButton = QtWidgets.QPushButton("前3个月")
-        last_3m_button.clicked.connect(lambda: self.set_start_date_by_symbol(3))
-        shortcut_hbox.addWidget(last_3m_button)
-
-        shortcut_widget.setLayout(shortcut_hbox)
 
         button: QtWidgets.QPushButton = QtWidgets.QPushButton("下载")
         button.clicked.connect(self.download)
@@ -643,141 +993,25 @@ class DownloadDialog(QtWidgets.QDialog):
         form.addRow("代码", self.symbol_edit)
         form.addRow("交易所", self.exchange_combo)
         form.addRow("周期", self.interval_combo)
-        form.addRow("复权参数", self.dividend_combo)
         form.addRow("开始日期", self.start_date_edit)
-        form.addRow("", shortcut_widget)
-        form.addRow("", self.use_end_date_check)
-        form.addRow("结束日期", self.end_date_edit)
-        form.addRow("", end_shortcut_widget)
         form.addRow(button)
 
         self.setLayout(form)
-
-    def set_start_date_by_symbol(self, months: int) -> None:
-        """"""
-        symbol: str = self.symbol_edit.text().strip()
-        if not symbol:
-            return
-
-        exchange: Exchange = self.exchange_combo.currentData()
-        contract_ym: tuple[int, int] | None = self.parse_contract_year_month(symbol, exchange)
-        if contract_ym is None:
-            return
-
-        year, month = contract_ym
-        start_year, start_month = self.shift_month(year, month, -months)
-        self.start_date_edit.setDate(QtCore.QDate(start_year, start_month, 1))
-
-    @staticmethod
-    def shift_month(year: int, month: int, month_delta: int) -> tuple[int, int]:
-        """"""
-        total_months: int = year * 12 + (month - 1) + month_delta
-        new_year: int = total_months // 12
-        new_month: int = total_months % 12 + 1
-        return new_year, new_month
-
-    def set_end_date_from_start(self, months: int) -> None:
-        """"""
-        if not self.use_end_date_check.isChecked():
-            return
-
-        start_date: QtCore.QDate = self.start_date_edit.date()
-        year: int = start_date.year()
-        month: int = start_date.month()
-        day: int = start_date.day()
-
-        target_year, target_month = self.shift_month(year, month, months)
-        target_date: QtCore.QDate = QtCore.QDate(target_year, target_month, day)
-
-        if not target_date.isValid():
-            month_start: QtCore.QDate = QtCore.QDate(target_year, target_month, 1)
-            day_offset: int = day - 1
-            target_date = month_start.addDays(day_offset)
-
-        self.end_date_edit.setDate(target_date)
-
-    @staticmethod
-    def parse_contract_year_month(symbol: str, exchange: Exchange) -> tuple[int, int] | None:
-        """
-        Parse contract delivery year/month by exchange-specific symbol rules.
-        """
-        if exchange == Exchange.CZCE:
-            return DownloadDialog.parse_czce_year_month(symbol)
-
-        match: re.Match[str] | None = re.search(r"(\d{2})(\d{2})$", symbol)
-        if not match:
-            return None
-
-        year: int = 2000 + int(match.group(1))
-        month: int = int(match.group(2))
-        if month < 1 or month > 12:
-            return None
-
-        return year, month
-
-    @staticmethod
-    def parse_czce_year_month(symbol: str) -> tuple[int, int] | None:
-        """
-        CZCE futures symbols use 3 trailing digits: YMM, e.g. TA505 -> 2025-05.
-        Infer decade from the current year so current-generation contracts map correctly.
-        """
-        match: re.Match[str] | None = re.search(r"(\d)(\d{2})$", symbol)
-        if not match:
-            return None
-
-        year_digit: int = int(match.group(1))
-        month: int = int(match.group(2))
-        if month < 1 or month > 12:
-            return None
-
-        current_year: int = datetime.now().year
-        decade_start: int = current_year // 10 * 10
-        year: int = decade_start + year_digit
-
-        # Keep the inferred year close to the current contract cycle.
-        if year < current_year - 5:
-            year += 10
-        elif year > current_year + 4:
-            year -= 10
-
-        return year, month
 
     def download(self) -> None:
         """"""
         symbol: str = self.symbol_edit.text()
         exchange: Exchange = Exchange(self.exchange_combo.currentData())
         interval: Interval = Interval(self.interval_combo.currentData())
-        dividend_type: str = self.dividend_combo.currentData()
 
         start_date = self.start_date_edit.date()
         start: datetime = datetime(start_date.year(), start_date.month(), start_date.day())
         start = start.replace(tzinfo=DB_TZ)
 
-        end: datetime | None = None
-        if self.use_end_date_check.isChecked():
-            end_date = self.end_date_edit.date()
-            end = datetime(end_date.year(), end_date.month(), end_date.day()) + timedelta(days=1)
-            end = end.replace(tzinfo=DB_TZ)
-
         if interval == Interval.TICK:
-            count: int = self.engine.download_tick_data(
-                symbol,
-                exchange,
-                start,
-                self.output,
-                end=end,
-                dividend_type=dividend_type,
-            )
+            count: int = self.engine.download_tick_data(symbol, exchange, start, self.output)
         else:
-            count = self.engine.download_bar_data(
-                symbol,
-                exchange,
-                interval,
-                start,
-                self.output,
-                end=end,
-                dividend_type=dividend_type,
-            )
+            count = self.engine.download_bar_data(symbol, exchange, interval, start, self.output)
 
         QtWidgets.QMessageBox.information(self, "下载结束", f"下载总数据量：{count}条")
 
